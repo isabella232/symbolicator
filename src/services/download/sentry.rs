@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use failsafe::futures::CircuitBreaker;
 use futures::prelude::*;
 use parking_lot::Mutex;
 use reqwest::StatusCode;
@@ -67,9 +68,15 @@ struct SearchResult {
     // TODO: Add more fields
 }
 
+/// Local struct to pass the query for [`SentryDownloader::list_files`] around.
+///
+/// This is entirely derived from [`SentrySourceConfig`], having it as a separate struct
+/// allows using it as a key in the [`SentryIndexCache`] LRU cache.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SearchQuery {
+    /// The URL to request, response is expected to be JSON.
     index_url: Url,
+    /// The Bearer Auth token for the request.
     token: String,
 }
 
@@ -84,11 +91,27 @@ pub enum SentryError {
 
     #[error("bad status code from Sentry: {0}")]
     BadStatusCode(StatusCode),
+
+    #[error("circuit-breaker open")]
+    CircuitBroken,
 }
+
+/// The concrete type of our circuit breaker.
+///
+/// We can not use a <dyn CirctuitBreaker> trait object, which would be more sane, as the
+/// trait is not object safe (it has methods with generic type parameters).
+type CircuitBreakerType = failsafe::StateMachine<
+    failsafe::failure_policy::OrElse<
+        failsafe::failure_policy::SuccessRateOverTimeWindow<failsafe::backoff::EqualJittered>,
+        failsafe::failure_policy::ConsecutiveFailures<failsafe::backoff::EqualJittered>,
+    >,
+    (),
+>;
 
 pub struct SentryDownloader {
     client: reqwest::Client,
     index_cache: Mutex<SentryIndexCache>,
+    circuit_breaker: CircuitBreakerType,
 }
 
 impl fmt::Debug for SentryDownloader {
@@ -105,6 +128,7 @@ impl SentryDownloader {
         Self {
             client,
             index_cache: Mutex::new(SentryIndexCache::new(100_000)),
+            circuit_breaker: failsafe::Config::new().build(),
         }
     }
 
@@ -118,7 +142,7 @@ impl SentryDownloader {
             .get(query.index_url.clone())
             .header("Accept-Encoding", "identity")
             .header("User-Agent", USER_AGENT)
-            .header("Authorization", format!("Bearer {}", &query.token))
+            .bearer_auth(&query.token)
             .send()
             .await?;
 
@@ -160,7 +184,13 @@ impl SentryDownloader {
             "Fetching list of Sentry debug files from {}",
             &query.index_url
         );
-        let entries = future_utils::retry(|| self.fetch_sentry_json(&query)).await?;
+        let entries =
+            future_utils::retry(|| self.circuit_breaker.call(self.fetch_sentry_json(&query)))
+                .await
+                .map_err(|e| match e {
+                    failsafe::Error::Inner(err) => err,
+                    failsafe::Error::Rejected => SentryError::CircuitBroken,
+                })?;
 
         if cache_duration > Duration::from_secs(0) {
             self.index_cache
@@ -219,37 +249,67 @@ impl SentryDownloader {
         file_source: SentryObjectFileSource,
         destination: PathBuf,
     ) -> Result<DownloadStatus, DownloadError> {
-        let download_url = file_source.url();
-        log::debug!("Fetching debug file from {}", download_url);
-        let result = future_utils::retry(|| {
-            self.client
-                .get(download_url.clone())
-                .header("User-Agent", USER_AGENT)
-                .header(
-                    "Authorization",
-                    format!("Bearer {}", &file_source.source.token),
-                )
-                .send()
-        });
+        match future_utils::retry(|| {
+            self.circuit_breaker
+                .call(self.download_source_once(file_source.clone(), destination.clone()))
+        })
+        .await
+        {
+            Ok(status) => {
+                log::debug!(
+                    "Fetched debug file from {}: {:?}",
+                    file_source.url(),
+                    status
+                );
+                Ok(status)
+            }
+            Err(e) => {
+                log::debug!(
+                    "Failed to fetch debug file from {}: {}",
+                    file_source.url(),
+                    e
+                );
+                match e {
+                    failsafe::Error::Inner(err) => Err(err),
+                    failsafe::Error::Rejected => Err(SentryError::CircuitBroken.into()),
+                }
+            }
+        }
+    }
 
-        match result.await {
+    /// Performs a one-shot download of a file.
+    ///
+    /// No retrying or circuit-breaking.
+    async fn download_source_once(
+        &self,
+        source: SentryObjectFileSource,
+        destination: PathBuf,
+    ) -> Result<DownloadStatus, DownloadError> {
+        match self
+            .client
+            .get(source.url())
+            .header("User-Agent", USER_AGENT)
+            .bearer_auth(&source.source.token)
+            .send()
+            .await
+        {
             Ok(response) => {
                 if response.status().is_success() {
-                    log::trace!("Success hitting {}", download_url);
+                    log::trace!("Success hitting {}", source.url());
                     let stream = response.bytes_stream().map_err(DownloadError::Reqwest);
 
-                    super::download_stream(file_source, stream, destination).await
+                    super::download_stream(source, stream, destination).await
                 } else {
                     log::trace!(
                         "Unexpected status code from {}: {}",
-                        download_url,
+                        source.url(),
                         response.status()
                     );
                     Ok(DownloadStatus::NotFound)
                 }
             }
             Err(e) => {
-                log::trace!("Skipping response from {}: {}", download_url, e);
+                log::trace!("Skipping response from {}: {}", source.url(), e);
                 Ok(DownloadStatus::NotFound) // must be wrong type
             }
         }
